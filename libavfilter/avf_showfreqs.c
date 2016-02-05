@@ -53,7 +53,7 @@ typedef struct ShowFreqsContext {
     float **avg_data;
     float *window_func_lut;
     float overlap;
-    int skip_samples;
+    int hop_size;
     int nb_channels;
     int nb_freq;
     int win_size;
@@ -111,6 +111,7 @@ static const AVOption showfreqs_options[] = {
         { "nuttall",  "Nuttall",          0, AV_OPT_TYPE_CONST, {.i64=WFUNC_NUTTALL},  0, 0, FLAGS, "win_func" },
         { "lanczos",  "Lanczos",          0, AV_OPT_TYPE_CONST, {.i64=WFUNC_LANCZOS},  0, 0, FLAGS, "win_func" },
         { "gauss",    "Gauss",            0, AV_OPT_TYPE_CONST, {.i64=WFUNC_GAUSS},    0, 0, FLAGS, "win_func" },
+        { "tukey",    "Tukey",            0, AV_OPT_TYPE_CONST, {.i64=WFUNC_TUKEY},    0, 0, FLAGS, "win_func" },
     { "overlap",  "set window overlap", OFFSET(overlap), AV_OPT_TYPE_FLOAT, {.dbl=1.}, 0., 1., FLAGS },
     { "averaging", "set time averaging", OFFSET(avg), AV_OPT_TYPE_INT, {.i64=1}, 0, INT32_MAX, FLAGS },
     { "colors", "set channels colors", OFFSET(colors), AV_OPT_TYPE_STRING, {.str = "red|green|blue|yellow|orange|lime|pink|magenta|brown" }, 0, 0, FLAGS },
@@ -149,6 +150,15 @@ static int query_formats(AVFilterContext *ctx)
     formats = ff_make_format_list(pix_fmts);
     if ((ret = ff_formats_ref(formats, &outlink->in_formats)) < 0)
         return ret;
+
+    return 0;
+}
+
+static av_cold int init(AVFilterContext *ctx)
+{
+    ShowFreqsContext *s = ctx->priv;
+
+    s->pts = AV_NOPTS_VALUE;
 
     return 0;
 }
@@ -204,8 +214,8 @@ static int config_output(AVFilterLink *outlink)
     ff_generate_window_func(s->window_func_lut, s->win_size, s->win_func, &overlap);
     if (s->overlap == 1.)
         s->overlap = overlap;
-    s->skip_samples = (1. - s->overlap) * s->win_size;
-    if (s->skip_samples < 1) {
+    s->hop_size = (1. - s->overlap) * s->win_size;
+    if (s->hop_size < 1) {
         av_log(ctx, AV_LOG_ERROR, "overlap %f too big\n", s->overlap);
         return AVERROR(EINVAL);
     }
@@ -422,7 +432,11 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     AVFilterContext *ctx = inlink->dst;
     ShowFreqsContext *s = ctx->priv;
     AVFrame *fin = NULL;
+    int consumed = 0;
     int ret = 0;
+
+    if (s->pts == AV_NOPTS_VALUE)
+        s->pts = in->pts - av_audio_fifo_size(s->fifo);
 
     av_audio_fifo_write(s->fifo, (void **)in->extended_data, in->nb_samples);
     while (av_audio_fifo_size(s->fifo) >= s->win_size) {
@@ -432,20 +446,21 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
             goto fail;
         }
 
-        fin->pts = s->pts;
-        s->pts += s->skip_samples;
+        fin->pts = s->pts + consumed;
+        consumed += s->hop_size;
         ret = av_audio_fifo_peek(s->fifo, (void **)fin->extended_data, s->win_size);
         if (ret < 0)
             goto fail;
 
         ret = plot_freqs(inlink, fin);
         av_frame_free(&fin);
-        av_audio_fifo_drain(s->fifo, s->skip_samples);
+        av_audio_fifo_drain(s->fifo, s->hop_size);
         if (ret < 0)
             goto fail;
     }
 
 fail:
+    s->pts = AV_NOPTS_VALUE;
     av_frame_free(&fin);
     av_frame_free(&in);
     return ret;
@@ -458,8 +473,10 @@ static av_cold void uninit(AVFilterContext *ctx)
 
     av_fft_end(s->fft);
     for (i = 0; i < s->nb_channels; i++) {
-        av_freep(&s->fft_data[i]);
-        av_freep(&s->avg_data[i]);
+        if (s->fft_data)
+            av_freep(&s->fft_data[i]);
+        if (s->avg_data)
+            av_freep(&s->avg_data[i]);
     }
     av_freep(&s->fft_data);
     av_freep(&s->avg_data);
@@ -488,6 +505,7 @@ static const AVFilterPad showfreqs_outputs[] = {
 AVFilter ff_avf_showfreqs = {
     .name          = "showfreqs",
     .description   = NULL_IF_CONFIG_SMALL("Convert input audio to a frequencies video output."),
+    .init          = init,
     .uninit        = uninit,
     .query_formats = query_formats,
     .priv_size     = sizeof(ShowFreqsContext),

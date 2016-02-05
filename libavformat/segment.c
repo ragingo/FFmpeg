@@ -30,6 +30,7 @@
 #include <time.h>
 
 #include "avformat.h"
+#include "avio_internal.h"
 #include "internal.h"
 
 #include "libavutil/avassert.h"
@@ -82,6 +83,8 @@ typedef struct SegmentContext {
     int   list_size;       ///< number of entries for the segment list file
 
     int use_clocktime;    ///< flag to cut segments at regular clock time
+    int64_t clocktime_offset; //< clock offset for cutting the segments at regular clock time
+    int64_t clocktime_wrap_duration; //< wrapping duration considered for starting a new segment
     int64_t last_val;      ///< remember last time for wrap around detection
     int64_t last_cut;      ///< remember last cut
     int cut_pending;
@@ -237,8 +240,8 @@ static int segment_start(AVFormatContext *s, int write_header)
     if ((err = set_segment_filename(s)) < 0)
         return err;
 
-    if ((err = avio_open2(&oc->pb, oc->filename, AVIO_FLAG_WRITE,
-                          &s->interrupt_callback, NULL)) < 0) {
+    if ((err = ffio_open_whitelist(&oc->pb, oc->filename, AVIO_FLAG_WRITE,
+                                   &s->interrupt_callback, NULL, s->protocol_whitelist)) < 0) {
         av_log(s, AV_LOG_ERROR, "Failed to open segment '%s'\n", oc->filename);
         return err;
     }
@@ -263,8 +266,8 @@ static int segment_list_open(AVFormatContext *s)
     int ret;
 
     snprintf(seg->temp_list_filename, sizeof(seg->temp_list_filename), seg->use_rename ? "%s.tmp" : "%s", seg->list);
-    ret = avio_open2(&seg->list_pb, seg->temp_list_filename, AVIO_FLAG_WRITE,
-                     &s->interrupt_callback, NULL);
+    ret = ffio_open_whitelist(&seg->list_pb, seg->temp_list_filename, AVIO_FLAG_WRITE,
+                     &s->interrupt_callback, NULL, s->protocol_whitelist);
     if (ret < 0) {
         av_log(s, AV_LOG_ERROR, "Failed to open segment list '%s'\n", seg->list);
         return ret;
@@ -633,6 +636,13 @@ static int seg_write_header(AVFormatContext *s)
                    seg->time_str);
             return ret;
         }
+        if (seg->use_clocktime) {
+            if (seg->time <= 0) {
+                av_log(s, AV_LOG_ERROR, "Invalid negative segment_time with segment_atclocktime option set\n");
+                return AVERROR(EINVAL);
+            }
+            seg->clocktime_offset = seg->time - (seg->clocktime_offset % seg->time);
+        }
     }
 
     if (seg->format_options_str) {
@@ -690,8 +700,8 @@ static int seg_write_header(AVFormatContext *s)
         goto fail;
 
     if (seg->write_header_trailer) {
-        if ((ret = avio_open2(&oc->pb, seg->header_filename ? seg->header_filename : oc->filename, AVIO_FLAG_WRITE,
-                              &s->interrupt_callback, NULL)) < 0) {
+        if ((ret = ffio_open_whitelist(&oc->pb, seg->header_filename ? seg->header_filename : oc->filename, AVIO_FLAG_WRITE,
+                              &s->interrupt_callback, NULL, s->protocol_whitelist)) < 0) {
             av_log(s, AV_LOG_ERROR, "Failed to open segment '%s'\n", oc->filename);
             goto fail;
         }
@@ -734,8 +744,8 @@ static int seg_write_header(AVFormatContext *s)
         } else {
             close_null_ctxp(&oc->pb);
         }
-        if ((ret = avio_open2(&oc->pb, oc->filename, AVIO_FLAG_WRITE,
-                              &s->interrupt_callback, NULL)) < 0)
+        if ((ret = ffio_open_whitelist(&oc->pb, oc->filename, AVIO_FLAG_WRITE,
+                              &s->interrupt_callback, NULL, s->protocol_whitelist)) < 0)
             goto fail;
         if (!seg->individual_header_trailer)
             oc->pb->seekable = 0;
@@ -775,8 +785,8 @@ static int seg_write_packet(AVFormatContext *s, AVPacket *pkt)
             time_t sec = avgt / 1000000;
             localtime_r(&sec, &ti);
             usecs = (int64_t)(ti.tm_hour * 3600 + ti.tm_min * 60 + ti.tm_sec) * 1000000 + (avgt % 1000000);
-            wrapped_val = usecs % seg->time;
-            if (seg->last_cut != usecs && wrapped_val < seg->last_val) {
+            wrapped_val = (usecs + seg->clocktime_offset) % seg->time;
+            if (seg->last_cut != usecs && wrapped_val < seg->last_val && wrapped_val < seg->clocktime_wrap_duration) {
                 seg->cut_pending = 1;
                 seg->last_cut = usecs;
             }
@@ -926,6 +936,8 @@ static const AVOption options[] = {
     { "hls", "Apple HTTP Live Streaming compatible", 0, AV_OPT_TYPE_CONST, {.i64=LIST_TYPE_M3U8 }, INT_MIN, INT_MAX, E, "list_type" },
 
     { "segment_atclocktime",      "set segment to be cut at clocktime",  OFFSET(use_clocktime), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, E},
+    { "segment_clocktime_offset", "set segment clocktime offset",        OFFSET(clocktime_offset), AV_OPT_TYPE_DURATION, {.i64 = 0}, 0, 86400000000LL, E},
+    { "segment_clocktime_wrap_duration", "set segment clocktime wrapping duration", OFFSET(clocktime_wrap_duration), AV_OPT_TYPE_DURATION, {.i64 = INT64_MAX}, 0, INT64_MAX, E},
     { "segment_time",      "set segment duration",                       OFFSET(time_str),AV_OPT_TYPE_STRING, {.str = NULL},  0, 0,       E },
     { "segment_time_delta","set approximation value used for the segment times", OFFSET(time_delta), AV_OPT_TYPE_DURATION, {.i64 = 0}, 0, 0, E },
     { "segment_times",     "set segment split time points",              OFFSET(times_str),AV_OPT_TYPE_STRING,{.str = NULL},  0, 0,       E },

@@ -93,8 +93,8 @@ static void calc_diffs(const DecimateContext *dm, struct qitem *q,
         const int linesize2 = f2->linesize[plane];
         const uint8_t *f1p = f1->data[plane];
         const uint8_t *f2p = f2->data[plane];
-        int width    = plane ? FF_CEIL_RSHIFT(f1->width,  dm->hsub) : f1->width;
-        int height   = plane ? FF_CEIL_RSHIFT(f1->height, dm->vsub) : f1->height;
+        int width    = plane ? AV_CEIL_RSHIFT(f1->width,  dm->hsub) : f1->width;
+        int height   = plane ? AV_CEIL_RSHIFT(f1->height, dm->vsub) : f1->height;
         int hblockx  = dm->blockx / 2;
         int hblocky  = dm->blocky / 2;
 
@@ -167,9 +167,12 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     if (in) {
         /* update frame metrics */
         prv = dm->fid ? dm->queue[dm->fid - 1].frame : dm->last;
-        if (!prv)
-            prv = in;
-        calc_diffs(dm, &dm->queue[dm->fid], prv, in);
+        if (!prv) {
+            dm->queue[dm->fid].maxbdiff = INT64_MAX;
+            dm->queue[dm->fid].totdiff  = INT64_MAX;
+        } else {
+            calc_diffs(dm, &dm->queue[dm->fid], prv, in);
+        }
         if (++dm->fid != dm->cycle)
             return 0;
         av_frame_free(&dm->last);

@@ -139,11 +139,15 @@ void av_format_inject_global_side_data(AVFormatContext *s)
 
 int ff_copy_whitelists(AVFormatContext *dst, AVFormatContext *src)
 {
-    av_assert0(!dst->codec_whitelist && !dst->format_whitelist);
+    av_assert0(!dst->codec_whitelist &&
+               !dst->format_whitelist &&
+               !dst->protocol_whitelist);
     dst-> codec_whitelist = av_strdup(src->codec_whitelist);
     dst->format_whitelist = av_strdup(src->format_whitelist);
+    dst->protocol_whitelist = av_strdup(src->protocol_whitelist);
     if (   (src-> codec_whitelist && !dst-> codec_whitelist)
-        || (src->format_whitelist && !dst->format_whitelist)) {
+        || (src->  format_whitelist && !dst->  format_whitelist)
+        || (src->protocol_whitelist && !dst->protocol_whitelist)) {
         av_log(dst, AV_LOG_ERROR, "Failed to duplicate whitelist\n");
         return AVERROR(ENOMEM);
     }
@@ -313,7 +317,7 @@ int av_demuxer_open(AVFormatContext *ic) {
     int err;
 
     if (ic->format_whitelist && av_match_list(ic->iformat->name, ic->format_whitelist, ',') <= 0) {
-        av_log(ic, AV_LOG_ERROR, "Format not on whitelist\n");
+        av_log(ic, AV_LOG_ERROR, "Format not on whitelist \'%s\'\n", ic->format_whitelist);
         return AVERROR(EINVAL);
     }
 
@@ -352,9 +356,11 @@ static int init_input(AVFormatContext *s, const char *filename,
         (!s->iformat && (s->iformat = av_probe_input_format2(&pd, 0, &score))))
         return score;
 
-    if ((ret = avio_open2(&s->pb, filename, AVIO_FLAG_READ | s->avio_flags,
-                          &s->interrupt_callback, options)) < 0)
+    if ((ret = ffio_open_whitelist(&s->pb, filename, AVIO_FLAG_READ | s->avio_flags,
+                                   &s->interrupt_callback, options,
+                                   s->protocol_whitelist)) < 0)
         return ret;
+
     if (s->iformat)
         return 0;
     return av_probe_input_buffer2(s->pb, &s->iformat, filename,
@@ -441,8 +447,16 @@ int avformat_open_input(AVFormatContext **ps, const char *filename,
         goto fail;
     s->probe_score = ret;
 
+    if (!s->protocol_whitelist && s->pb && s->pb->protocol_whitelist) {
+        s->protocol_whitelist = av_strdup(s->pb->protocol_whitelist);
+        if (!s->protocol_whitelist) {
+            ret = AVERROR(ENOMEM);
+            goto fail;
+        }
+    }
+
     if (s->format_whitelist && av_match_list(s->iformat->name, s->format_whitelist, ',') <= 0) {
-        av_log(s, AV_LOG_ERROR, "Format not on whitelist\n");
+        av_log(s, AV_LOG_ERROR, "Format not on whitelist \'%s\'\n", s->format_whitelist);
         ret = AVERROR(EINVAL);
         goto fail;
     }
@@ -2927,10 +2941,14 @@ static int get_std_framerate(int i)
         return (i + 1) * 1001;
     i -= 30*12;
 
-    if (i < 7)
-        return ((const int[]) { 40, 48, 50, 60, 80, 120, 240})[i] * 1001 * 12;
+    if (i < 30)
+        return (i + 31) * 1001 * 12;
+    i -= 30;
 
-    i -= 7;
+    if (i < 3)
+        return ((const int[]) { 80, 120, 240})[i] * 1001 * 12;
+
+    i -= 3;
 
     return ((const int[]) { 24, 30, 60, 12, 15, 48 })[i] * 1000 * 12;
 }

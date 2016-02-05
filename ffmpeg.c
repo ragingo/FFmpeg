@@ -527,6 +527,8 @@ static void ffmpeg_cleanup(int ret)
         av_freep(&ost->audio_channels_map);
         ost->audio_channels_mapped = 0;
 
+        av_dict_free(&ost->sws_dict);
+
         avcodec_free_context(&ost->enc_ctx);
 
         av_freep(&output_streams[i]);
@@ -554,8 +556,12 @@ static void ffmpeg_cleanup(int ret)
         av_freep(&input_streams[i]);
     }
 
-    if (vstats_file)
-        fclose(vstats_file);
+    if (vstats_file) {
+        if (fclose(vstats_file))
+            av_log(NULL, AV_LOG_ERROR,
+                   "Error closing vstats file, loss of information possible: %s\n",
+                   av_err2str(AVERROR(errno)));
+    }
     av_freep(&vstats_filename);
 
     av_freep(&input_streams);
@@ -1501,6 +1507,7 @@ static void print_report(int is_last_report, int64_t timer_start, int64_t cur_ti
     static int64_t last_time = -1;
     static int qp_histogram[52];
     int hours, mins, secs, us;
+    int ret;
     float t;
 
     if (!print_stats && !is_last_report && !progress_avio)
@@ -1559,7 +1566,7 @@ static void print_report(int is_last_report, int64_t timer_start, int64_t cur_ti
                 if (qp >= 0 && qp < FF_ARRAY_ELEMS(qp_histogram))
                     qp_histogram[qp]++;
                 for (j = 0; j < 32; j++)
-                    snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf), "%X", (int)lrintf(log2(qp_histogram[j] + 1)));
+                    snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf), "%X", av_log2(qp_histogram[j] + 1));
             }
 
             if ((enc->flags & AV_CODEC_FLAG_PSNR) && (ost->pict_type != AV_PICTURE_TYPE_NONE || is_last_report)) {
@@ -1667,7 +1674,9 @@ static void print_report(int is_last_report, int64_t timer_start, int64_t cur_ti
         avio_flush(progress_avio);
         av_bprint_finalize(&buf_script, NULL);
         if (is_last_report) {
-            avio_closep(&progress_avio);
+            if ((ret = avio_closep(&progress_avio)) < 0)
+                av_log(NULL, AV_LOG_ERROR,
+                       "Error closing progress log, loss of information possible: %s\n", av_err2str(ret));
         }
     }
 
@@ -1702,11 +1711,11 @@ static void flush_encoders(void)
             switch (enc->codec_type) {
             case AVMEDIA_TYPE_AUDIO:
                 encode = avcodec_encode_audio2;
-                desc   = "Audio";
+                desc   = "audio";
                 break;
             case AVMEDIA_TYPE_VIDEO:
                 encode = avcodec_encode_video2;
-                desc   = "Video";
+                desc   = "video";
                 break;
             default:
                 stop_encoding = 1;
@@ -1722,7 +1731,7 @@ static void flush_encoders(void)
 
                 update_benchmark(NULL);
                 ret = encode(enc, &pkt, NULL, &got_packet);
-                update_benchmark("flush %s %d.%d", desc, ost->file_index, ost->index);
+                update_benchmark("flush_%s %d.%d", desc, ost->file_index, ost->index);
                 if (ret < 0) {
                     av_log(NULL, AV_LOG_FATAL, "%s encoding failed: %s\n",
                            desc,
@@ -4117,16 +4126,12 @@ static int transcode(void)
         }
 
         ret = transcode_step();
-        if (ret < 0) {
-            if (ret == AVERROR_EOF || ret == AVERROR(EAGAIN)) {
-                continue;
-            } else {
-                char errbuf[128];
-                av_strerror(ret, errbuf, sizeof(errbuf));
+        if (ret < 0 && ret != AVERROR_EOF) {
+            char errbuf[128];
+            av_strerror(ret, errbuf, sizeof(errbuf));
 
-                av_log(NULL, AV_LOG_ERROR, "Error while filtering: %s\n", errbuf);
-                break;
-            }
+            av_log(NULL, AV_LOG_ERROR, "Error while filtering: %s\n", errbuf);
+            break;
         }
 
         /* dump report by using the output first video and audio streams */
@@ -4197,7 +4202,10 @@ static int transcode(void)
             ost = output_streams[i];
             if (ost) {
                 if (ost->logfile) {
-                    fclose(ost->logfile);
+                    if (fclose(ost->logfile))
+                        av_log(NULL, AV_LOG_ERROR,
+                               "Error closing logfile, loss of information possible: %s\n",
+                               av_err2str(AVERROR(errno)));
                     ost->logfile = NULL;
                 }
                 av_freep(&ost->forced_kf_pts);

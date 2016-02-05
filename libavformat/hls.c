@@ -180,6 +180,7 @@ struct variant {
 
 typedef struct HLSContext {
     AVClass *class;
+    AVFormatContext *avfmt;
     int n_variants;
     struct variant **variants;
     int n_playlists;
@@ -589,6 +590,14 @@ static int url_connect(struct playlist *pls, AVDictionary *opts, AVDictionary *o
     av_dict_copy(&tmp, opts, 0);
     av_dict_copy(&tmp, opts2, 0);
 
+    if (pls->parent->protocol_whitelist) {
+        pls->input->protocol_whitelist =  av_strdup(pls->parent->protocol_whitelist);
+        if (!pls->input->protocol_whitelist) {
+            av_dict_free(&tmp);
+            return AVERROR(ENOMEM);
+        }
+    }
+
     if ((ret = ffurl_connect(pls->input, &tmp)) < 0) {
         ffurl_close(pls->input);
         pls->input = NULL;
@@ -610,11 +619,23 @@ static int open_url(HLSContext *c, URLContext **uc, const char *url, AVDictionar
 {
     AVDictionary *tmp = NULL;
     int ret;
+    const char *proto_name = avio_find_protocol_name(url);
+
+    if (!proto_name)
+        return AVERROR_INVALIDDATA;
+
+    // only http(s) & file are allowed
+    if (!av_strstart(proto_name, "http", NULL) && !av_strstart(proto_name, "file", NULL))
+        return AVERROR_INVALIDDATA;
+    if (!strncmp(proto_name, url, strlen(proto_name)) && url[strlen(proto_name)] == ':')
+        ;
+    else if (strcmp(proto_name, "file") || !strncmp(url, "file,", 5))
+        return AVERROR_INVALIDDATA;
 
     av_dict_copy(&tmp, c->avio_opts, 0);
     av_dict_copy(&tmp, opts, 0);
 
-    ret = ffurl_open(uc, url, AVIO_FLAG_READ, c->interrupt_callback, &tmp);
+    ret = ffurl_open_whitelist(uc, url, AVIO_FLAG_READ, c->interrupt_callback, &tmp, c->avfmt->protocol_whitelist);
     if( ret >= 0) {
         // update cookies on http response with setcookies.
         URLContext *u = *uc;
@@ -659,8 +680,8 @@ static int parse_playlist(HLSContext *c, const char *url,
         av_dict_set(&opts, "headers", c->headers, 0);
         av_dict_set(&opts, "http_proxy", c->http_proxy, 0);
 
-        ret = avio_open2(&in, url, AVIO_FLAG_READ,
-                         c->interrupt_callback, &opts);
+        ret = ffio_open_whitelist(&in, url, AVIO_FLAG_READ,
+                         c->interrupt_callback, &opts, c->avfmt->protocol_whitelist);
         av_dict_free(&opts);
         if (ret < 0)
             return ret;
@@ -1497,6 +1518,7 @@ static int hls_read_header(AVFormatContext *s)
     HLSContext *c = s->priv_data;
     int ret = 0, i, j, stream_offset = 0;
 
+    c->avfmt = s;
     c->interrupt_callback = &s->interrupt_callback;
     c->strict_std_compliance = s->strict_std_compliance;
 
@@ -1971,6 +1993,7 @@ static int hls_probe(AVProbeData *p)
      * somewhere for a proper match. */
     if (strncmp(p->buf, "#EXTM3U", 7))
         return 0;
+
     if (strstr(p->buf, "#EXT-X-STREAM-INF:")     ||
         strstr(p->buf, "#EXT-X-TARGETDURATION:") ||
         strstr(p->buf, "#EXT-X-MEDIA-SEQUENCE:"))
